@@ -100,6 +100,9 @@ function check_collusion(particle)
     if particle.r[3] < 0
         @reset particle.v[3] = -particle.v[3]
     end
+    if norm(particle.v) > 150
+        @reset particle.v = SVector(0.0, 0.0, 0.0)
+    end
 
     return particle
 end
@@ -109,16 +112,18 @@ function main()
     k = 1.0 # gas constant
     μ = 0.00001 # viscosity constant
     g = 0
+    h = 0.1
     x_length = 1.0
     z_length = 1.0
-    h = 0.05
-    num_particles = length(0:2h:x_length) * length(0:2h:z_length)
+    x_range = 0:h:x_length
+    z_range = 0:h:z_length
+    num_particles = length(x_range) * length(z_range)
 
     particles = begin
         m = fill(8h^3, num_particles)
         ρ = fill(1.0, num_particles)
-        p = fill(1.0, num_particles)
-        r = [SVector(abs(x + h * randn()), 0, abs(z + h * randn())) for x in 0:2h:x_length for z in 0:2h:z_length]
+        p = fill(4.9, num_particles)
+        r = [SVector(x + h / 10 * rand(), 0, z + h / 10 * rand()) for x in x_range for z in z_range]
         v = [SVector(0.0, 0.0, 0.0) for _ in 1:num_particles]
         f = [SVector(0.0, 0.0, 0.0) for _ in 1:num_particles]
         StructArray{Particle}((m, ρ, p, r, v, f))
@@ -126,7 +131,7 @@ function main()
 
     dt = 0.01
     x, y, z = 0:0.01:3, 0.0, -0.1:0.01:1.4
-    times = range(0, 1, step=dt)
+    times = range(0, 5, step=dt)
 
     pressure = zeros(num_particles)
     viscosity = zeros(num_particles)
@@ -134,7 +139,7 @@ function main()
     l = @layout([a; b])
     anim = Animation()
 
-    for (n, time) ∈ enumerate(times)
+    @showprogress for (n, time) ∈ enumerate(times)
         @reset particles.ρ = ρ_smooth.(particles.r, [particles], h) #바뀌는 도중에 업데이트 되나? 안될거 같긴 함.
 
         for (i, particle) in enumerate(particles)
@@ -149,14 +154,13 @@ function main()
         rs = Iterators.product(x, y, z)
         rsv = reshape(collect(rs), length(x), length(z))
         color_field = color_smooth.(rsv, [particles], h)
-        println("$n steps, $time s: $(size(color_field))")
         plot(
             scatter(getindex.(particles.r, 1), getindex.(particles.r, 3), clims=(0, 10), zcolor=norm.(particles.v), xlims=[0, 3], ylims=[-0.1, 1.4], title="particles, $time s", label="velocity", aspect_ratio=:equal),
             heatmap(x, z, color_field', aspect_ratio=:equal, clims=(0, 3.0), title="color field, $time s", xlims=[0, 3], ylims=[-0.1, 1.4]), layout=l
         )
         frame(anim)
     end
-    gif(anim, "anim_fps1.gif", fps=5)
+    gif(anim, "anim_fps5.gif", fps=5)
 
     println("done")
 end
