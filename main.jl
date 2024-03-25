@@ -8,10 +8,8 @@ using Accessors
 using Zygote
 using StructArrays
 using ProgressMeter
-
-k = 1 # gas constant
-μ = 1 # viscosity constant
-
+using BenchmarkTools
+using WriteVTK
 
 struct Particle{T}
     m::T
@@ -22,7 +20,7 @@ struct Particle{T}
     f::SVector{3,T}
 end
 
-function χ(p) # Indicator function
+function χ(p::Bool) # Indicator function
     if p
         return 1.0
     else
@@ -37,83 +35,130 @@ end
 
 function ∇2_W_viscosity(r, h::Float64)
     r_norm = norm(r)
-    45/(pi*h^6)*(h-r_norm)
+    45 / (pi * h^6) * (h - r_norm)
 end
 
-function C_smooth(r, particles) # smoothed color field 
-    sum = 0
+function color_smooth(r::Tuple{T,T,T}, particles, h) where {T}
+    color_smooth(SVector(r), particles, h)
+end
+function pressure_smooth(r::Tuple{T,T,T}, particles, h) where {T}
+    pressure_smooth(SVector(r), particles, h)
+end
+function ρ_smooth(r::Tuple{T,T,T}, particles, h) where {T}
+    ρ_smooth(SVector(r), particles, h)
+end
+
+function color_smooth(r::SVector{3,T}, particles, h) where {T}# smoothed color field 
+    sum = 0.0
     for p in particles
         sum += p.m * (1 / p.ρ) * W_poly6(norm(r - p.r), h)
     end
     return sum
 end
 
-function eval_pressure_force(particles, i)
-    f_pressure = SVector(0, 0, 0)
+function ρ_smooth(r::SVector{3,T}, particles, h) where {T}
+    sum = 0.0
+    for p in particles
+        sum += p.m * W_poly6(norm(r - p.r), h)
+    end
+    return sum
+end
 
+function pressure_smooth(r::SVector{3,T}, particles, h) where {T}
+    sum = 0.0
+    for p in particles
+        sum += p.m * p.p / p.ρ * W_poly6(norm(r - p.r), h)
+    end
+    return sum
+end
+
+function eval_pressure_force(particles, i, h::Float64)
+    f_pressure = SVector(0, 0, 0)
     for (j, particle_j) in enumerate(particles)
-        if i == j
-            continue
-        end
         f_pressure = -particle_j.m * (particles[i].p + particle_j.p) / (2 * particle_j.ρ) * gradient(r -> W_poly6(r, h), particles[i].r - particle_j.r)[1]
     end
-
     return f_pressure
 end
 
-function eval_viscosity_force(particles, i)
+function eval_viscosity_force(particles, i, μ, h)
     f_viscosity = SVector(0, 0, 0)
     for (j, _) in enumerate(particles)
-        if i == j
-            continue
-        end
-        f_viscosity += particle.m[j] *(particle.v[j]-particle.v[i])/particle.ρ[j]*∇2_W_viscosity(particle.r[i]-particle.r[j], h)
+        f_viscosity += particles.m[j] * (particles.v[j] - particles.v[i]) / particles.ρ[j] * ∇2_W_viscosity(particles.r[i] - particles.r[j], h)
     end
     f_viscosity *= μ
     return f_viscosity
 end
 
+function apply_gravity()
+    return 9.8 * [0.0, 0.0, -1.0]
+end
+
+function check_collusion(particle)
+    if particle.r[1] < 0
+        @reset particle.v[1] = -particle.v[1]
+    end
+    if particle.r[3] < 0
+        @reset particle.v[3] = -particle.v[3]
+    end
+
+    return particle
+end
+
 # init 
-grid = 10
-num_particles = grid^3
-h = 1 / grid 
+function main()
+    k = 1.0 # gas constant
+    μ = 0.00001 # viscosity constant
+    g = 0
+    x_length = 1.0
+    z_length = 1.0
+    h = 0.05
+    num_particles = length(0:2h:x_length) * length(0:2h:z_length)
 
-particles = begin
-    m = fill(1 / num_particles, num_particles)
-    ρ = fill(1.0, num_particles)
-    p = fill(1.0, num_particles)
-    r = [SVector(rand(), rand(), rand()) for _ in 1:num_particles]
-    v = [SVector(rand(), rand(), rand()) for _ in 1:num_particles]
-    f = [SVector(0.0, 0.0, 0.0) for _ in 1:num_particles]
+    particles = begin
+        m = fill(8h^3, num_particles)
+        ρ = fill(1.0, num_particles)
+        p = fill(1.0, num_particles)
+        r = [SVector(abs(x + h * randn()), 0, abs(z + h * randn())) for x in 0:2h:x_length for z in 0:2h:z_length]
+        v = [SVector(0.0, 0.0, 0.0) for _ in 1:num_particles]
+        f = [SVector(0.0, 0.0, 0.0) for _ in 1:num_particles]
+        StructArray{Particle}((m, ρ, p, r, v, f))
+    end
 
-    StructArray{Particle}((m, ρ, p, r, v, f))
+    dt = 0.01
+    x, y, z = 0:0.01:3, 0.0, -0.1:0.01:1.4
+    times = range(0, 1, step=dt)
+
+    pressure = zeros(num_particles)
+    viscosity = zeros(num_particles)
+
+    l = @layout([a; b])
+    anim = Animation()
+
+    for (n, time) ∈ enumerate(times)
+        @reset particles.ρ = ρ_smooth.(particles.r, [particles], h) #바뀌는 도중에 업데이트 되나? 안될거 같긴 함.
+
+        for (i, particle) in enumerate(particles)
+            @reset particles.f[i] = eval_pressure_force(particles, i, h) + eval_viscosity_force(particles, i, μ, h)
+            pressure[i] = norm(eval_pressure_force(particles, i, h))
+            viscosity[i] = norm(eval_viscosity_force(particles, i, μ, h))
+        end
+        @reset particles.v .+= (particles.f ./ particles.ρ .+ [apply_gravity()]) * dt
+        @reset particles .= check_collusion.(particles)
+        @reset particles.r .+= particles.v * dt
+
+        rs = Iterators.product(x, y, z)
+        rsv = reshape(collect(rs), length(x), length(z))
+        color_field = color_smooth.(rsv, [particles], h)
+        println("$n steps, $time s: $(size(color_field))")
+        plot(
+            scatter(getindex.(particles.r, 1), getindex.(particles.r, 3), clims=(0, 10), zcolor=norm.(particles.v), xlims=[0, 3], ylims=[-0.1, 1.4], title="particles, $time s", label="velocity", aspect_ratio=:equal),
+            heatmap(x, z, color_field', aspect_ratio=:equal, clims=(0, 3.0), title="color field, $time s", xlims=[0, 3], ylims=[-0.1, 1.4]), layout=l
+        )
+        frame(anim)
+    end
+    gif(anim, "anim_fps1.gif", fps=5)
+
+    println("done")
 end
 
-# calc pressure grad. force
-@showprogress for (i, particle) in enumerate(particles)
-    @reset particles.f[i] = calculate_p(particles, i)
-end
-
-begin
-    x = [coord[1] for coord in particles.r]
-    y = [coord[2] for coord in getfield.(particles, :r)]
-    z = [coord[3] for coord in getfield.(particles, :r)]
-    fx = [coord[1] for coord in getfield.(particles, :f)]
-    fy = [coord[2] for coord in getfield.(particles, :f)]
-    fz = [coord[3] for coord in getfield.(particles, :f)]
-    scatter3d(x, y, z, xlims=[0, 1], ylims=[0, 1], zlims=[0, 1])
-    quiver!(x, y, z, quiver=(x + fx, y + fy, z + fz), xlims=[0, 1], ylims=[0, 1], zlims=[0, 1])
-    getfield.(particles, :f)
-end
-
-
-
-begin
-    rs = [[x, y, 0.5] for x = -0.1:0.01:1.1, y = -0.1:0.01:1.1]
-    flat_rs = vec(rs)
-    color_field = C_S.(flat_rs, [particles])
-    scatter(getindex.(flat_rs, 1), getindex.(flat_rs, 2), zcolor=color_field, alpha=1)
-end
-
-
-gradient(r -> W_poly6(r, h), 0.2)`
+@time main()
