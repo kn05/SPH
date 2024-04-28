@@ -18,6 +18,7 @@ struct Particle{T}
     r::SVector{3,T}
     v::SVector{3,T} # velocity field
     f::SVector{3,T}
+    n::SVector{3,T}
 end
 
 function χ(p::Bool) # Indicator function
@@ -31,6 +32,13 @@ end
 function W_poly6(r, h) # kernel function
     r_norm = norm(r)
     return 315 / (64 * pi * h^9) * (h^2 - r_norm^2)^3 * χ(0 <= r_norm <= h)
+end
+
+Base.:-(x::Tuple{Float64,Float64}, y::Tuple{Float64,Float64}) = x .- y
+Base.:-(x::Tuple{Float64,Float64}, y::Vector{Float64}) = Tuple(x .- y)
+function findnearest(p, x_range, y_range)
+    xy_grid = collect(Iterators.product(x_range, y_range))
+    idx = findmin(norm.(xy_grid .- [p]))[2]
 end
 
 function ∇2_W_viscosity(r, h::Float64)
@@ -48,12 +56,27 @@ function ρ_smooth(r::Tuple{T,T,T}, particles, h) where {T}
     ρ_smooth(SVector(r), particles, h)
 end
 
+
+function ∇(m::Matrix, h) #=h is size of cell=#
+    x_length, y_length = size(m)
+    diff_x = diff(m, dims=1)
+    diff_y = diff(m, dims=2)
+    dfdx = vcat(diff_x[1, :]', (diff_x[1:end-1, :] + diff_x[2:end, :]) / 2, diff_x[end, :]') / h
+    dfdy = hcat(diff_y[:, 1], (diff_y[:, 1:end-1] + diff_y[:, 2:end]) / 2, diff_y[:, end]) / h
+    new_mat = map(x -> SVector(x[1], 0.0, x[2]), zip(dfdx, dfdy))
+end
+
 function color_smooth(r::SVector{3,T}, particles, h) where {T}# smoothed color field 
     sum = 0.0
     for p in particles
         sum += p.m * (1 / p.ρ) * W_poly6(norm(r - p.r), h)
     end
     return sum
+end
+
+function eval_n(r, particles, h)
+    n = gradient(r -> color_smooth(r, particles, h), r)[1]
+    return n
 end
 
 function ρ_smooth(r::SVector{3,T}, particles, h) where {T}
@@ -90,7 +113,7 @@ function eval_viscosity_force(particles, i, μ, h)
 end
 
 function apply_gravity()
-    return 9.8 * [0.0, 0.0, -1.0]
+    return 1.8 * [0.0, 0.0, -1.0]
 end
 
 function check_collusion(particle)
@@ -110,28 +133,29 @@ end
 # init 
 function main()
     k = 1.0 # gas constant
-    μ = 0.00001 # viscosity constant
+    μ = 8.0 # viscosity constant
     g = 0
-    h = 0.1
-    x_length = 1.0
-    z_length = 1.0
-    x_range = 0:h:x_length
-    z_range = 0:h:z_length
+    h = 0.1 # 0.04
+    x_length = 2.56
+    z_length = 2.56
+    x_range = x_length*0.3:h*0.6:x_length*0.7
+    z_range = 0:h*0.6:z_length*0.4
     num_particles = length(x_range) * length(z_range)
 
     particles = begin
-        m = fill(8h^3, num_particles)
-        ρ = fill(1.0, num_particles)
+        m = fill(0.02, num_particles)
+        ρ = fill(1000.0, num_particles)
         p = fill(4.9, num_particles)
         r = [SVector(x + h / 10 * rand(), 0, z + h / 10 * rand()) for x in x_range for z in z_range]
         v = [SVector(0.0, 0.0, 0.0) for _ in 1:num_particles]
         f = [SVector(0.0, 0.0, 0.0) for _ in 1:num_particles]
-        StructArray{Particle}((m, ρ, p, r, v, f))
+        n = [SVector(0.0, 0.0, 0.0) for _ in 1:num_particles]
+        StructArray{Particle{Float64}}((m, ρ, p, r, v, f, n))
     end
 
     dt = 0.01
-    x, y, z = 0:0.01:3, 0.0, -0.1:0.01:1.4
-    times = range(0, 5, step=dt)
+    x, y, z = 0:0.04:2.56, 0.0, 0:0.04:2.56
+    times = range(0, 2, step=dt)
 
     pressure = zeros(num_particles)
     viscosity = zeros(num_particles)
@@ -140,7 +164,8 @@ function main()
     anim = Animation()
 
     @showprogress for (n, time) ∈ enumerate(times)
-        @reset particles.ρ = ρ_smooth.(particles.r, [particles], h) #바뀌는 도중에 업데이트 되나? 안될거 같긴 함.
+        @reset particles.ρ = ρ_smooth.(particles.r, [particles], h)
+
 
         for (i, particle) in enumerate(particles)
             @reset particles.f[i] = eval_pressure_force(particles, i, h) + eval_viscosity_force(particles, i, μ, h)
@@ -154,14 +179,17 @@ function main()
         rs = Iterators.product(x, y, z)
         rsv = reshape(collect(rs), length(x), length(z))
         color_field = color_smooth.(rsv, [particles], h)
+        n_field = ∇(color_field, 0.01)
+        particle_idxs = findnearest.(getindex.(particles.r, [[1, 3]]), [x_range], [z_range])
+        @reset particles.n = getindex.([n_field], particle_idxs)
+
         plot(
-            scatter(getindex.(particles.r, 1), getindex.(particles.r, 3), clims=(0, 10), zcolor=norm.(particles.v), xlims=[0, 3], ylims=[-0.1, 1.4], title="particles, $time s", label="velocity", aspect_ratio=:equal),
-            heatmap(x, z, color_field', aspect_ratio=:equal, clims=(0, 3.0), title="color field, $time s", xlims=[0, 3], ylims=[-0.1, 1.4]), layout=l
+            scatter(getindex.(particles.r, 1), getindex.(particles.r, 3), clims=(0, 25), zcolor=norm.(particles.n), xlims=[0, x_length], ylims=[0, x_length], title="particles, $time s", label="n", aspect_ratio=:equal, markersize=0.5),
+            heatmap(x, z, norm.(n_field)', aspect_ratio=:equal, clims=(0, 25), title="n, $time s", xlims=[0, x_length], ylims=[-0.1, x_length]), layout=l
         )
         frame(anim)
     end
-    gif(anim, "anim_fps5.gif", fps=5)
-
+    gif(anim, "수치조정버전2_anim_fps5.gif", fps=5)
     println("done")
 end
 
